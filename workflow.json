@@ -1,0 +1,208 @@
+{
+  "app": {
+    "name": "Sastras AI",
+    "url": "https://sastrasai.com",
+    "what_it_does": "Reads a writer's own blog, learns how they write, then writes new blog posts in their voice and delivers them to their WordPress site. It can run by hand or on a schedule.",
+    "stack": [
+      "Next.js 16 + TypeScript",
+      "Tailwind 4 + shadcn/ui",
+      "Clerk (sign-in)",
+      "Supabase (Postgres + pgvector)",
+      "Inngest (background jobs)",
+      "LLMs behind one adapter (writing)",
+      "TypeSafe Jev (scoring and yes/no judgments)",
+      "Voyage AI (embeddings)",
+      "Firecrawl (web research, optional)",
+      "Tiptap (editor)",
+      "Razorpay (payments)",
+      "Vercel (hosting)"
+    ]
+  },
+
+  "draft_statuses": ["idea", "generating", "in review", "approved", "published", "rejected"],
+
+  "flows": [
+    {
+      "id": "setup",
+      "name": "Sign up and connect a site",
+      "trigger": "A new writer opens the app",
+      "steps": [
+        { "n": 1, "what": "Sign up or log in", "where": "/signup, /login (Clerk)" },
+        { "n": 2, "what": "Enter the site address or sitemap address", "where": "/onboarding → POST /api/sites" },
+        { "n": 3, "what": "The app sends the event site/analyze.requested and answers at once. The work runs in the background.", "where": "Inngest job analyze-site" },
+        { "n": 4, "what": "Connect a way to publish (optional at this point): WordPress plugin or WordPress login", "where": "/onboarding, /settings" }
+      ],
+      "next": "analyze"
+    },
+    {
+      "id": "analyze",
+      "name": "Analyze the site and learn the writer's style",
+      "trigger": "Event site/analyze.requested (new site, or the Re-analyze button)",
+      "job": "analyze-site",
+      "steps": [
+        { "n": 1, "step": "start", "what": "Mark the site as being analyzed" },
+        { "n": 2, "step": "scrape-and-store", "what": "Read the sitemap, scrape each post (title, text, headings, meta, date, links), save the posts. Obeys robots.txt." },
+        { "n": 3, "step": "embed-batch-N", "what": "Split posts into chunks and embed them (Voyage) into pgvector. This is the memory the writing agents search." },
+        { "n": 4, "step": "style-profile", "what": "Build the style profile: tone, average length, heading structure, sentence style, point of view, common phrases" },
+        { "n": 5, "step": "cluster-topics", "what": "Group the posts into topics, using the post embeddings" },
+        { "n": 6, "step": "finish", "what": "Mark the site ready. Create its Autopilot settings, switched off." },
+        { "n": 7, "step": "suggest-topics", "what": "Send ideas/suggest.requested, so the first visit to New blog already has topics. Skipped when Jev is not set up." }
+      ],
+      "next": "suggest_topics"
+    },
+    {
+      "id": "suggest_topics",
+      "name": "Suggest topics",
+      "trigger": "Event ideas/suggest.requested (an analysis finished, or the Suggest topics button on /drafts/new)",
+      "job": "suggest-ideas",
+      "steps": [
+        { "n": 1, "agent": "Scout", "model": "none", "what": "Find gaps on the writer's own site: thin topics, keywords mentioned but never covered, follow-ups, pages with no links out. Leaves out any topic that already has a draft." },
+        { "n": 2, "agent": "Naming", "model": "cheap tier, one call for the whole batch", "what": "Turn Scout's placeholder titles into real titles, or mark an idea as not a topic. An idea with no good title is skipped." },
+        { "n": 3, "agent": "Judge", "model": "TypeSafe Jev", "what": "Score each idea 0–100 for fit with the site, and check the exclusion rules (duplicate, too close to an idea the writer rejected). Under the fit bar: skipped, with a written reason." }
+      ],
+      "result": "A list of scored ideas. No draft is written and no draft is counted against the month.",
+      "next": "manual_draft"
+    },
+    {
+      "id": "manual_draft",
+      "name": "Write a draft by hand (Manual mode)",
+      "trigger": "The writer picks a suggested topic or types their own on /drafts/new → POST /api/drafts → event draft/generate.requested",
+      "job": "generate-draft",
+      "steps": [
+        { "n": 1, "step": "reserve-and-create", "what": "Take one draft from the month's limit (one atomic database statement) and create the draft with status generating. No slot left: nothing is written and nothing is spent." },
+        { "n": 2, "step": "pipeline", "what": "Run the four writing agents in order. See the flow writing_pipeline." },
+        { "n": 3, "step": "release-slot", "what": "Only if the draft failed: give the slot back, so a failure does not cost the writer a draft." }
+      ],
+      "result": "Draft with status in review",
+      "next": "review"
+    },
+    {
+      "id": "writing_pipeline",
+      "name": "The four writing agents",
+      "trigger": "Called by generate-draft, regenerate-draft and autopilot-run",
+      "note": "Each step saves its result. A failed draft restarts from the failed step and does not pay again for the steps before it.",
+      "steps": [
+        { "n": 1, "agent": "Research", "model": "cheap tier", "what": "Find the writer's related posts in pgvector. With a search key set, also read up to 3 pages from other sites on the topic. Write the brief." },
+        { "n": 2, "agent": "Writing", "model": "frontier or mid tier", "what": "Write the post in the writer's voice from the style profile, the brief and real examples. One Jev score on how hard the topic is picks the tier." },
+        { "n": 3, "agent": "SEO", "model": "cheap tier + Jev", "what": "Title options, meta description, slug. Internal links to the writer's own posts, ranked by Jev." },
+        { "n": 4, "agent": "Editing", "model": "mid tier + Jev", "what": "Fix grammar and clarity, keep the style consistent. Jev checks each sentence and flags claims that need a source." }
+      ],
+      "result": "Draft with status in review. The agents cannot set any status past this.",
+      "next": "review"
+    },
+    {
+      "id": "review",
+      "name": "Review a draft",
+      "trigger": "The writer opens a draft on /drafts/[id]",
+      "choices": [
+        { "action": "Edit", "what": "Change the text in the editor" },
+        { "action": "Regenerate a section", "what": "Rewrite one section", "event": "draft/regenerate-section.requested", "job": "regenerate-section" },
+        { "action": "Regenerate the draft", "what": "Write the whole draft again", "event": "draft/regenerate.requested", "job": "regenerate-draft" },
+        { "action": "Reject", "what": "Status becomes rejected. The reason is saved. Scout never proposes that topic again, and a topic-related reason is shown to the Judge.", "where": "POST /api/drafts/[draftId]/reject" },
+        { "action": "Approve", "what": "Status becomes approved. The draft is handed to the site's publishing connection.", "where": "POST /api/drafts/[draftId]/approve", "next": "publish" },
+        { "action": "Rate", "what": "Rate the draft 1 to 5", "where": "POST /api/feedback" }
+      ],
+      "logged": "Every approve, reject, regenerate and edit is saved as feedback."
+    },
+    {
+      "id": "publish",
+      "name": "Deliver an approved draft",
+      "trigger": "A draft becomes approved (the writer's click, or the run itself in Autopilot mode)",
+      "rule": "Only approved drafts leave the app. One draft is published once.",
+      "routes": [
+        {
+          "id": "wordpress_plugin",
+          "open": true,
+          "how": "The writer installs our plugin and pastes one key. The plugin calls the app: GET /api/plugin/posts → creates the post in WordPress → POST /api/plugin/posts/[draftId]/confirm. It checks every 5 minutes, and at once when nudged.",
+          "lands_as": "A WordPress draft, or a live post if the site owner chose Publish in the plugin's settings"
+        },
+        {
+          "id": "wordpress_login",
+          "open": true,
+          "how": "WordPress username + Application Password. The app pushes the post through the WordPress REST API.",
+          "lands_as": "Always a WordPress draft"
+        },
+        {
+          "id": "copy_download",
+          "open": true,
+          "how": "Copy or download the approved draft as HTML or Markdown",
+          "where": "/api/drafts/[draftId]/export"
+        },
+        { "id": "github", "open": false, "status": "Coming soon. Built, not offered." },
+        { "id": "hosted_blog", "open": false, "status": "Coming soon. Built, not offered." }
+      ],
+      "result": "Draft with status published once the site confirms the post"
+    },
+    {
+      "id": "autopilot",
+      "name": "Autopilot: the same work on a schedule",
+      "trigger": "Cron 0 2 * * * (02:00 UTC, 07:30 in India), or the Run now button → event autopilot/run.requested",
+      "modes": [
+        { "mode": "Manual", "topic_picked_by": "writer", "approved_by": "writer" },
+        { "mode": "Semi-autopilot", "topic_picked_by": "agent", "approved_by": "writer, one click per draft" },
+        { "mode": "Autopilot", "topic_picked_by": "agent", "approved_by": "the run itself", "needs": "A connection that puts posts live: the WordPress plugin set to Publish" }
+      ],
+      "settings": {
+        "cadence": ["Every day", "Every weekday", "Twice a week (Monday and Thursday)", "Weekly"],
+        "fit_bar": { "Strict": 75, "Balanced": 60, "Broad": 45 },
+        "max_drafts_per_week": "set by the writer"
+      },
+      "jobs": [
+        {
+          "job": "autopilot-scheduler",
+          "steps": [
+            { "n": 1, "step": "expire-trials", "what": "Close free months that have ended" },
+            { "n": 2, "step": "recheck-subscriptions", "what": "Check paid plans that may have ended" },
+            { "n": 3, "step": "due-sites", "what": "Pick the sites with Autopilot on, not paused, and due by their cadence. Send one autopilot/run.requested for each." }
+          ]
+        },
+        {
+          "job": "autopilot-run",
+          "steps": [
+            { "n": 1, "step": "preflight", "what": "Refuse to start if the writing models or Jev are not set up. Make sure this month's usage record exists." },
+            { "n": 2, "step": "run", "what": "Claim the site (one run at a time), re-read the settings, then Scout → Naming → Judge (as in suggest_topics), then the writing_pipeline for each idea that passed, up to the weekly and monthly limits" },
+            { "n": 3, "step": "hands-off", "what": "Autopilot mode only: approve the drafts this run wrote and hand them to the site, through the same code as the Approve button. In Semi-autopilot the drafts wait in review." }
+          ]
+        }
+      ],
+      "next": "review (Semi-autopilot) or publish (Autopilot)"
+    },
+    {
+      "id": "billing",
+      "name": "Plans and payment",
+      "trigger": "The writer chooses a plan on /pricing",
+      "steps": [
+        { "n": 1, "what": "Checkout", "where": "/checkout/[plan] → Razorpay subscription" },
+        { "n": 2, "what": "Payment is confirmed and the plan and its monthly draft limit are updated", "where": "/api/billing/verify, /api/webhooks/razorpay" }
+      ],
+      "plans": [
+        { "plan": "Free", "price": "₹0", "drafts_per_month": 3, "sites": 1, "autopilot": false },
+        { "plan": "Pro", "price": "₹2,499 / month", "drafts_per_month": 30, "sites": 1, "autopilot": true },
+        { "plan": "Ultra", "price": "₹6,999 / month", "drafts_per_month": 100, "sites": 3, "autopilot": true },
+        { "plan": "Enterprise", "price": "Custom" }
+      ]
+    }
+  ],
+
+  "events": [
+    { "event": "site/analyze.requested", "job": "analyze-site", "sent_by": "POST /api/sites, POST /api/sites/[siteId]/analyze" },
+    { "event": "ideas/suggest.requested", "job": "suggest-ideas", "sent_by": "analyze-site when it finishes, POST /api/ideas" },
+    { "event": "draft/generate.requested", "job": "generate-draft", "sent_by": "POST /api/drafts" },
+    { "event": "draft/regenerate.requested", "job": "regenerate-draft", "sent_by": "POST /api/drafts/[draftId]/regenerate" },
+    { "event": "draft/regenerate-section.requested", "job": "regenerate-section", "sent_by": "POST /api/drafts/[draftId]/sections/[index]/regenerate" },
+    { "event": "autopilot/run.requested", "job": "autopilot-run", "sent_by": "autopilot-scheduler (cron), POST /api/sites/[siteId]/autopilot/run" }
+  ],
+
+  "rules": [
+    "Nothing reaches a site without an approval. In Manual and Semi-autopilot the writer approves. In Autopilot mode the run approves its own drafts, and only for a site whose owner chose that.",
+    "The writing agents cannot publish. They stop at in review.",
+    "Every skipped idea keeps a written reason, shown on the dashboard.",
+    "An idea the Judge could not score is skipped, never written.",
+    "Limits are checked before any model is called. A run at its limit costs nothing.",
+    "One Autopilot run per site at a time. A second run waits.",
+    "A run stops after 2 drafts in a row fail.",
+    "A topic that already has a draft is not proposed again. A rejection is remembered.",
+    "Once a person has seen a draft, a retry cannot overwrite it.",
+    "Every model call is recorded with provider, model, tokens and cost."
+  ]
+}
